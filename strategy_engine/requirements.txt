@@ -1,0 +1,9 @@
+pandas>=2.0.0
+numpy>=1.24.0
+pandas-ta>=0.3.14b
+TA-Lib>=0.4.25
+redis>=4.5.0
+aio-pika>=9.0.0
+pymongo>=4.5.0
+asyncio>=3.4.3
+python-dotenv>=1.0.0

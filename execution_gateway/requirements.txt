@@ -1,0 +1,5 @@
+ccxt>=4.0.0
+aio-pika>=9.0.0
+pymongo>=4.5.0
+asyncio>=3.4.3
+python-dotenv>=1.0.0

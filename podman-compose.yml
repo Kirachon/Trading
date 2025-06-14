@@ -1,0 +1,212 @@
+version: "3.8"
+
+services:
+  # Infrastructure Services
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - trading_net
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=admin
+      - RABBITMQ_DEFAULT_PASS=SecureRabbit2024!
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - trading_net
+    restart: unless-stopped
+
+  postgresql:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=trading
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=SecureDB2024!
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./config/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - trading_net
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=SecureDB2024!
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - trading_net
+    restart: unless-stopped
+
+  # Core Trading Services
+  market_data:
+    build:
+      context: ./market_data
+      dockerfile: Containerfile
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - MONGODB_URL=mongodb://admin:SecureDB2024!@mongodb:27017/trading_data?authSource=admin
+    depends_on:
+      - redis
+      - mongodb
+    networks:
+      - trading_net
+    restart: unless-stopped
+
+  strategy_engine:
+    build:
+      context: ./strategy_engine
+      dockerfile: Containerfile
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - RABBITMQ_URL=amqp://admin:SecureRabbit2024!@rabbitmq:5672/
+      - MONGODB_URL=mongodb://admin:SecureDB2024!@mongodb:27017/trading_data?authSource=admin
+    depends_on:
+      - redis
+      - rabbitmq
+      - mongodb
+      - market_data
+    networks:
+      - trading_net
+    restart: unless-stopped
+
+  risk_management:
+    build:
+      context: ./risk_management
+      dockerfile: Containerfile
+    environment:
+      - RABBITMQ_URL=amqp://admin:SecureRabbit2024!@rabbitmq:5672/
+      - POSTGRES_URL=postgresql://admin:SecureDB2024!@postgresql:5432/trading
+    depends_on:
+      - rabbitmq
+      - postgresql
+    networks:
+      - trading_net
+    restart: unless-stopped
+
+  execution_gateway:
+    build:
+      context: ./execution_gateway
+      dockerfile: Containerfile
+    environment:
+      - RABBITMQ_URL=amqp://admin:SecureRabbit2024!@rabbitmq:5672/
+      - MONGODB_URL=mongodb://admin:SecureDB2024!@mongodb:27017/trading_data?authSource=admin
+    depends_on:
+      - rabbitmq
+      - mongodb
+    networks:
+      - trading_net
+    restart: unless-stopped
+
+  portfolio_accounting:
+    build:
+      context: ./portfolio_accounting
+      dockerfile: Containerfile
+    environment:
+      - RABBITMQ_URL=amqp://admin:SecureRabbit2024!@rabbitmq:5672/
+      - POSTGRES_URL=postgresql://admin:SecureDB2024!@postgresql:5432/trading
+    depends_on:
+      - rabbitmq
+      - postgresql
+    networks:
+      - trading_net
+    restart: unless-stopped
+
+  trade_logger:
+    build:
+      context: ./trade_logger
+      dockerfile: Containerfile
+    environment:
+      - RABBITMQ_URL=amqp://admin:SecureRabbit2024!@rabbitmq:5672/
+      - MONGODB_URL=mongodb://admin:SecureDB2024!@mongodb:27017/trading_data?authSource=admin
+    depends_on:
+      - rabbitmq
+      - mongodb
+    networks:
+      - trading_net
+    restart: unless-stopped
+
+  notifications:
+    build:
+      context: ./notifications
+      dockerfile: Containerfile
+    environment:
+      - RABBITMQ_URL=amqp://admin:SecureRabbit2024!@rabbitmq:5672/
+      - REDIS_URL=redis://redis:6379
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - SMTP_SERVER=${SMTP_SERVER}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USERNAME=${SMTP_USERNAME}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - EMAIL_FROM=${EMAIL_FROM}
+      - EMAIL_TO=${EMAIL_TO}
+    depends_on:
+      - rabbitmq
+      - redis
+    networks:
+      - trading_net
+    restart: unless-stopped
+
+  backtesting:
+    build:
+      context: ./backtesting
+      dockerfile: Containerfile
+    environment:
+      - MONGODB_URL=mongodb://admin:SecureDB2024!@mongodb:27017/trading_data?authSource=admin
+      - POSTGRES_URL=postgresql://admin:SecureDB2024!@postgresql:5432/trading
+      - RABBITMQ_URL=amqp://admin:SecureRabbit2024!@rabbitmq:5672/
+    depends_on:
+      - mongodb
+      - postgresql
+      - rabbitmq
+    networks:
+      - trading_net
+    restart: unless-stopped
+
+  ui_gateway:
+    build:
+      context: ./ui_gateway
+      dockerfile: Containerfile
+    ports:
+      - "8501:8501"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_URL=postgresql://admin:SecureDB2024!@postgresql:5432/trading
+      - MONGODB_URL=mongodb://admin:SecureDB2024!@mongodb:27017/trading_data?authSource=admin
+      - RABBITMQ_URL=amqp://admin:SecureRabbit2024!@rabbitmq:5672/
+    depends_on:
+      - redis
+      - postgresql
+      - mongodb
+      - rabbitmq
+    networks:
+      - trading_net
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  rabbitmq_data:
+  postgres_data:
+  mongo_data:
+
+networks:
+  trading_net:
+    driver: bridge
