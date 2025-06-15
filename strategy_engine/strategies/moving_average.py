@@ -3,6 +3,7 @@ Moving Average Crossover Strategy
 """
 import pandas as pd
 import numpy as np
+from typing import Optional
 from .base_strategy import BaseStrategy
 import logging
 
@@ -187,6 +188,88 @@ class MovingAverageCrossover(BaseStrategy):
         except Exception as e:
             logger.error(f"Error getting indicator values: {e}")
             return {}
+
+    def generate_signals_optimized(self, rolling_window) -> Optional[float]:
+        """
+        Generate signals using optimized rolling window data.
+
+        Args:
+            rolling_window: RollingWindow instance with OHLCV data
+
+        Returns:
+            Single signal value (1: buy, -1: sell, 0: hold) or None
+        """
+        try:
+            if not rolling_window.is_ready(max(self.short_window, self.long_window) + 5):
+                return None
+
+            # Get efficient moving averages from rolling window
+            short_ma = rolling_window.get_simple_moving_average(self.short_window)
+            long_ma = rolling_window.get_simple_moving_average(self.long_window)
+
+            if short_ma is None or long_ma is None:
+                return None
+
+            # Get previous values for crossover detection
+            # We need to calculate previous MAs to detect crossover
+            closes = rolling_window.get_closes()
+            if len(closes) < max(self.short_window, self.long_window) + 1:
+                return None
+
+            # Calculate previous MAs
+            prev_short_ma = np.mean(closes[-(self.short_window+1):-1])
+            prev_long_ma = np.mean(closes[-(self.long_window+1):-1])
+
+            # Detect crossovers
+            current_bullish = short_ma > long_ma
+            prev_bullish = prev_short_ma > prev_long_ma
+
+            # Generate signal on crossover
+            if current_bullish and not prev_bullish:
+                # Bullish crossover - buy signal
+                signal = 1.0
+            elif not current_bullish and prev_bullish:
+                # Bearish crossover - sell signal
+                signal = -1.0
+            else:
+                # No crossover
+                signal = 0.0
+
+            # Apply trend strength filter
+            if signal != 0.0:
+                signal = self._apply_trend_filter_optimized(signal, short_ma, long_ma, rolling_window)
+
+            return signal
+
+        except Exception as e:
+            logger.error(f"Error in optimized MA signal generation: {e}")
+            return None
+
+    def _apply_trend_filter_optimized(self, signal: float, short_ma: float,
+                                    long_ma: float, rolling_window) -> float:
+        """Apply trend strength filter using optimized data."""
+        try:
+            # Calculate trend strength
+            ma_spread_pct = abs(short_ma - long_ma) / long_ma
+
+            # Get recent volatility
+            closes = rolling_window.get_closes(20)
+            if len(closes) >= 20:
+                volatility = np.std(closes) / np.mean(closes)
+
+                # Reduce signal strength in high volatility
+                if volatility > 0.05:  # 5% volatility threshold
+                    signal *= 0.5
+
+                # Require minimum trend strength
+                if ma_spread_pct < 0.001:  # 0.1% minimum spread
+                    signal *= 0.3
+
+            return signal
+
+        except Exception as e:
+            logger.error(f"Error applying trend filter: {e}")
+            return signal
     
     def get_strategy_description(self) -> str:
         """Get human-readable strategy description."""

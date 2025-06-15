@@ -6,6 +6,16 @@ import numpy as np
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Tuple, Optional
 import logging
+import sys
+import os
+
+# Import rolling window for optimized processing
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+try:
+    from shared.rolling_window import RollingWindow
+except ImportError:
+    # Fallback if import fails
+    RollingWindow = None
 
 logger = logging.getLogger(__name__)
 
@@ -216,3 +226,79 @@ class BaseStrategy(ABC):
             take_profit = entry_price - (stop_distance * risk_reward_ratio)
         
         return stop_loss, take_profit
+
+    def generate_signals_optimized(self, rolling_window) -> Optional[float]:
+        """
+        Generate trading signals using optimized rolling window data.
+
+        This method can be overridden by strategies that want to use
+        optimized processing. Default implementation falls back to
+        DataFrame-based processing.
+
+        Args:
+            rolling_window: RollingWindow instance with OHLCV data
+
+        Returns:
+            Single signal value (1: buy, -1: sell, 0: hold) or None
+        """
+        if RollingWindow is None or rolling_window is None:
+            return None
+
+        # Default implementation: convert to DataFrame and use standard method
+        try:
+            df = rolling_window.to_dataframe()
+            if df.empty:
+                return None
+
+            signals = self.generate_signals(df)
+            if signals is None or signals.empty:
+                return None
+
+            return signals.iloc[-1]
+
+        except Exception as e:
+            logger.error(f"Error in optimized signal generation for {self.strategy_id}: {e}")
+            return None
+
+    def calculate_exits_optimized(self, rolling_window, signal: float) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Calculate stop loss and take profit using optimized rolling window data.
+
+        Args:
+            rolling_window: RollingWindow instance with OHLCV data
+            signal: Trading signal value
+
+        Returns:
+            Tuple of (stop_loss, take_profit) prices
+        """
+        if RollingWindow is None or rolling_window is None:
+            return None, None
+
+        try:
+            latest_point = rolling_window.get_latest()
+            if not latest_point:
+                return None, None
+
+            entry_price = latest_point.close
+
+            # Calculate ATR for dynamic stops (simplified)
+            if len(rolling_window) >= 14:
+                highs = rolling_window.get_highs(14)
+                lows = rolling_window.get_lows(14)
+                closes = rolling_window.get_closes(14)
+
+                # Simple ATR calculation
+                high_low = highs - lows
+                high_close = np.abs(highs[1:] - closes[:-1])
+                low_close = np.abs(lows[1:] - closes[:-1])
+
+                true_ranges = np.maximum(high_low[1:], np.maximum(high_close, low_close))
+                atr = np.mean(true_ranges) if len(true_ranges) > 0 else None
+            else:
+                atr = None
+
+            return self.calculate_stop_loss_take_profit(entry_price, signal, atr)
+
+        except Exception as e:
+            logger.error(f"Error calculating optimized exits for {self.strategy_id}: {e}")
+            return None, None

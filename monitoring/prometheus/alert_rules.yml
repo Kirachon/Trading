@@ -1,0 +1,143 @@
+# Prometheus Alert Rules for Trading System
+groups:
+  - name: trading_system_alerts
+    rules:
+      # Service Health Alerts
+      - alert: ServiceDown
+        expr: up{job=~"trading-.*"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Trading service {{ $labels.job }} is down"
+          description: "Service {{ $labels.job }} has been down for more than 30 seconds."
+
+      - alert: HighErrorRate
+        expr: rate(trading_errors_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate in {{ $labels.service }}"
+          description: "Error rate in {{ $labels.service }} is {{ $value }} errors/sec for more than 2 minutes."
+
+      - alert: HighResponseTime
+        expr: histogram_quantile(0.95, rate(trading_request_duration_seconds_bucket[5m])) > 1.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High response time in {{ $labels.service }}"
+          description: "95th percentile response time in {{ $labels.service }} is {{ $value }}s for more than 5 minutes."
+
+      # Trading-Specific Alerts
+      - alert: RiskViolation
+        expr: rate(trading_risk_violations_total[1m]) > 0
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Risk violation detected"
+          description: "Risk violation of type {{ $labels.violation_type }} with severity {{ $labels.severity }} detected."
+
+      - alert: HighMarketDataLatency
+        expr: histogram_quantile(0.95, rate(trading_market_data_latency_seconds_bucket[5m])) > 0.5
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High market data latency"
+          description: "Market data latency for {{ $labels.exchange }} is {{ $value }}s for more than 3 minutes."
+
+      - alert: SlowOrderExecution
+        expr: histogram_quantile(0.95, rate(trading_order_execution_seconds_bucket[5m])) > 2.0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow order execution"
+          description: "Order execution time for {{ $labels.exchange }} is {{ $value }}s for more than 2 minutes."
+
+      - alert: NoTradesProcessed
+        expr: rate(trading_trades_processed_total[10m]) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No trades processed"
+          description: "No trades have been processed for {{ $labels.exchange }} in the last 10 minutes."
+
+      - alert: PortfolioValueDrop
+        expr: (trading_portfolio_value_usd - trading_portfolio_value_usd offset 1h) / trading_portfolio_value_usd offset 1h < -0.05
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Significant portfolio value drop"
+          description: "Portfolio value for {{ $labels.exchange }}/{{ $labels.strategy }} has dropped by more than 5% in the last hour."
+
+      # Infrastructure Alerts
+      - alert: DatabaseConnectionsHigh
+        expr: trading_active_connections{connection_type="database"} > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High database connections"
+          description: "{{ $labels.service }} has {{ $value }} active database connections for more than 5 minutes."
+
+      - alert: WebSocketConnectionsHigh
+        expr: trading_websocket_connections > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High WebSocket connections"
+          description: "{{ $labels.service }} has {{ $value }} active WebSocket connections for more than 5 minutes."
+
+      - alert: MemoryUsageHigh
+        expr: (process_resident_memory_bytes / 1024 / 1024) > 512
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage"
+          description: "{{ $labels.job }} is using {{ $value }}MB of memory for more than 10 minutes."
+
+  - name: infrastructure_alerts
+    rules:
+      - alert: PostgreSQLDown
+        expr: up{job="postgresql"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL is down"
+          description: "PostgreSQL database has been down for more than 30 seconds."
+
+      - alert: MongoDBDown
+        expr: up{job="mongodb"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "MongoDB is down"
+          description: "MongoDB database has been down for more than 30 seconds."
+
+      - alert: RedisDown
+        expr: up{job="redis"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis is down"
+          description: "Redis cache has been down for more than 30 seconds."
+
+      - alert: RabbitMQDown
+        expr: up{job="rabbitmq"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "RabbitMQ is down"
+          description: "RabbitMQ message broker has been down for more than 30 seconds."

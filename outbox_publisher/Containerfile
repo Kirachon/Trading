@@ -1,4 +1,4 @@
-# Multi-stage build for Execution Gateway Service
+# Multi-stage build for Outbox Publisher Service
 FROM python:3.11-slim as base
 
 # Install system dependencies
@@ -28,9 +28,9 @@ WORKDIR /app
 COPY shared /app/shared
 
 # Copy application code
-COPY execution_gateway/ .
+COPY outbox_publisher/ .
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
-CMD ["python", "execution_service.py"]
+CMD ["python", "outbox_service.py"]

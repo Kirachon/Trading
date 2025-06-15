@@ -1,8 +1,7 @@
-FROM python:3.11-slim
+# Strategy Engine Service using optimized base image with TA-Lib
+FROM python:3.11-slim as talib-builder
 
-WORKDIR /app
-
-# Install system dependencies for TA-Lib
+# Install build dependencies
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
@@ -10,8 +9,8 @@ RUN apt-get update && apt-get install -y \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Install TA-Lib C library
-RUN wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && \
+# Build and install TA-Lib C library
+RUN wget -q http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && \
     tar -xzf ta-lib-0.4.0-src.tar.gz && \
     cd ta-lib/ && \
     ./configure --prefix=/usr && \
@@ -20,17 +19,20 @@ RUN wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && \
     cd .. && \
     rm -rf ta-lib ta-lib-0.4.0-src.tar.gz
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Production stage using optimized base
+FROM localhost/trading-base:latest
+
+# Copy TA-Lib libraries from builder stage
+USER root
+COPY --from=talib-builder /usr/lib/libta_lib* /usr/lib/
+COPY --from=talib-builder /usr/include/ta-lib /usr/include/ta-lib
+USER appuser
 
 # Copy application code
-COPY . .
+COPY strategy_engine/ .
 
-# Copy shared modules
-COPY ../shared /app/shared
-
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import sys; sys.exit(0)" || exit 1
 
 CMD ["python", "strategy_engine.py"]

@@ -14,7 +14,6 @@ import os
 import sys
 from datetime import datetime, timedelta
 import time
-from streamlit_autorefresh import st_autorefresh
 
 # Add shared modules to path
 sys.path.append('/app')
@@ -23,6 +22,13 @@ sys.path.append('/app')
 from data_access import DataAccess
 from portfolio_manager import PortfolioManager
 from strategy_controller import StrategyController
+from websocket_client import (
+    init_websocket_connection,
+    get_realtime_data,
+    is_websocket_connected,
+    show_websocket_status,
+    cleanup_websocket
+)
 
 # Configure Streamlit page
 st.set_page_config(
@@ -62,13 +68,17 @@ if 'data_access' not in st.session_state:
     st.session_state.portfolio_manager = PortfolioManager()
     st.session_state.strategy_controller = StrategyController()
 
-# Auto-refresh every 5 seconds
-count = st_autorefresh(interval=5000, limit=None, key="dashboard_refresh")
+# Initialize WebSocket connection for real-time updates
+websocket_url = os.getenv('WEBSOCKET_URL', 'ws://localhost:8765')
+websocket_client = init_websocket_connection(websocket_url)
 
 def main():
     """Main dashboard function."""
     st.title("🚀 Algorithmic Trading Dashboard")
-    
+
+    # Show WebSocket connection status
+    show_websocket_status()
+
     # Sidebar for navigation and controls
     with st.sidebar:
         st.header("Navigation")
@@ -76,22 +86,22 @@ def main():
             "Select Page",
             ["Overview", "Portfolio", "Strategies", "Trading History", "Risk Management", "System Status"]
         )
-        
+
         st.header("Quick Controls")
-        
+
         # Emergency stop button
         if st.button("🛑 EMERGENCY STOP", type="primary"):
             emergency_stop()
-        
+
         # Strategy controls
         st.subheader("Strategy Controls")
         if st.button("▶️ Enable All Strategies"):
             enable_all_strategies()
-        
+
         if st.button("⏸️ Disable All Strategies"):
             disable_all_strategies()
-        
-        # Refresh data button
+
+        # Manual refresh button (fallback)
         if st.button("🔄 Refresh Data"):
             refresh_all_data()
     
@@ -110,15 +120,17 @@ def main():
         show_system_status()
 
 def show_overview():
-    """Show overview dashboard."""
+    """Show overview dashboard with real-time data."""
     st.header("📊 Trading Overview")
-    
-    # Get portfolio summary
-    portfolio_summary = st.session_state.portfolio_manager.get_portfolio_summary()
-    
+
+    # Get portfolio summary from real-time data or fallback to cached
+    portfolio_summary = get_realtime_data('portfolio_summary', {})
+    if not portfolio_summary:
+        portfolio_summary = st.session_state.portfolio_manager.get_portfolio_summary()
+
     # Key metrics row
     col1, col2, col3, col4 = st.columns(4)
-    
+
     with col1:
         total_balance = portfolio_summary.get('total_balance', 0)
         st.metric(
@@ -126,7 +138,7 @@ def show_overview():
             value=f"${total_balance:,.2f}",
             delta=None
         )
-    
+
     with col2:
         daily_pnl = portfolio_summary.get('daily_pnl', 0)
         delta_color = "normal" if daily_pnl >= 0 else "inverse"
@@ -136,14 +148,14 @@ def show_overview():
             delta=f"{daily_pnl:+.2f}",
             delta_color=delta_color
         )
-    
+
     with col3:
         position_count = portfolio_summary.get('position_count', 0)
         st.metric(
             label="Active Positions",
             value=str(position_count)
         )
-    
+
     with col4:
         # Get strategy status
         strategy_status = st.session_state.strategy_controller.get_strategy_status()
@@ -177,34 +189,42 @@ def show_portfolio():
     
     # Positions table
     st.subheader("Current Positions")
-    positions = st.session_state.portfolio_manager.get_positions()
-    
+
+    # Get positions from real-time data or fallback
+    positions = get_realtime_data('positions', [])
+    if not positions:
+        positions = st.session_state.portfolio_manager.get_positions()
+
     if positions:
         positions_df = pd.DataFrame(positions)
-        
+
         # Format the dataframe
         if not positions_df.empty:
             positions_df['unrealized_pnl'] = positions_df['unrealized_pnl'].apply(lambda x: f"${x:.2f}")
             positions_df['quantity'] = positions_df['quantity'].apply(lambda x: f"{x:.6f}")
             positions_df['avg_price'] = positions_df['avg_price'].apply(lambda x: f"${x:.4f}")
-            
+
             st.dataframe(
                 positions_df[['symbol', 'side', 'quantity', 'avg_price', 'unrealized_pnl', 'strategy_id']],
                 use_container_width=True
             )
     else:
         st.info("No active positions")
-    
+
     # Balances
     st.subheader("Account Balances")
-    balances = st.session_state.portfolio_manager.get_balances()
-    
+
+    # Get balances from real-time data or fallback
+    balances = get_realtime_data('balances', [])
+    if not balances:
+        balances = st.session_state.portfolio_manager.get_balances()
+
     if balances:
         balances_df = pd.DataFrame(balances)
         if not balances_df.empty:
             balances_df['balance'] = balances_df['balance'].apply(lambda x: f"{x:.6f}")
             balances_df['locked'] = balances_df['locked'].apply(lambda x: f"{x:.6f}")
-            
+
             st.dataframe(
                 balances_df[['asset', 'balance', 'locked', 'exchange_id']],
                 use_container_width=True
@@ -501,21 +521,26 @@ def show_strategy_performance_chart():
     st.plotly_chart(fig, use_container_width=True)
 
 def show_recent_trades():
-    """Show recent trades table."""
-    # Get recent trades
-    recent_trades = st.session_state.data_access.get_recent_trades(limit=10)
-    
+    """Show recent trades table with real-time updates."""
+    # Get recent trades from real-time data or fallback
+    recent_trades = get_realtime_data('recent_trades', [])
+    if not recent_trades:
+        recent_trades = st.session_state.data_access.get_recent_trades(limit=10)
+
     if recent_trades:
-        trades_df = pd.DataFrame(recent_trades)
-        
+        trades_df = pd.DataFrame(recent_trades[-10:])  # Show last 10 trades
+
         # Format for display
         if 'timestamp' in trades_df.columns:
             trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'], unit='ms')
             trades_df['time'] = trades_df['timestamp'].dt.strftime('%H:%M:%S')
-        
+        elif 'created_at' in trades_df.columns:
+            trades_df['created_at'] = pd.to_datetime(trades_df['created_at'])
+            trades_df['time'] = trades_df['created_at'].dt.strftime('%H:%M:%S')
+
         display_columns = ['time', 'symbol', 'side', 'quantity', 'price', 'strategy_id']
         available_columns = [col for col in display_columns if col in trades_df.columns]
-        
+
         st.dataframe(
             trades_df[available_columns],
             use_container_width=True,

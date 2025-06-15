@@ -14,10 +14,8 @@ import pandas as pd
 import numpy as np
 import vectorbt as vbt
 from backtesting import Backtest, Strategy
-import pymongo
-from pymongo import MongoClient
-import psycopg2
-from psycopg2.extras import RealDictCursor
+from motor.motor_asyncio import AsyncIOMotorClient
+import asyncpg
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -50,7 +48,7 @@ class BacktestingService:
 
         # Database connections
         self.mongo_client = None
-        self.postgres_conn = None
+        self.postgres_pool = None
         self.db = None
 
         # Backtesting results storage
@@ -70,17 +68,21 @@ class BacktestingService:
             await self.rabbitmq_publisher.connect()
 
             # Connect to databases
-            self.mongo_client = MongoClient(self.mongodb_url)
+            self.mongo_client = AsyncIOMotorClient(self.mongodb_url)
             self.db = self.mongo_client['trading_data']
             self.results_collection = self.db['backtest_results']
 
-            self.postgres_conn = psycopg2.connect(self.postgres_url)
+            # Test MongoDB connection
+            await self.mongo_client.admin.command('ping')
 
-            # Create indexes for backtest results
-            self.results_collection.create_index([("backtest_id", 1)])
-            self.results_collection.create_index([("strategy_id", 1)])
-            self.results_collection.create_index([("symbol", 1)])
-            self.results_collection.create_index([("created_at", 1)])
+            # Create PostgreSQL connection pool
+            self.postgres_pool = await asyncpg.create_pool(self.postgres_url)
+
+            # Create indexes for backtest results (async)
+            await self.results_collection.create_index([("backtest_id", 1)])
+            await self.results_collection.create_index([("strategy_id", 1)])
+            await self.results_collection.create_index([("symbol", 1)])
+            await self.results_collection.create_index([("created_at", 1)])
 
             # Initialize strategy implementations
             self.initialize_strategy_implementations()
@@ -118,14 +120,12 @@ class BacktestingService:
             start_timestamp = int(start_date.timestamp() * 1000)
             end_timestamp = int(end_date.timestamp() * 1000)
 
-            cursor = collection.find({
+            data = await collection.find({
                 'timestamp': {
                     '$gte': start_timestamp,
                     '$lte': end_timestamp
                 }
-            }).sort('timestamp', 1)
-
-            data = list(cursor)
+            }).sort('timestamp', 1).to_list(length=None)
 
             if not data:
                 logger.warning(f"No historical data found for {symbol} {timeframe}")
@@ -286,7 +286,7 @@ class BacktestingService:
             }
 
             # Store results
-            self.results_collection.insert_one(results)
+            await self.results_collection.insert_one(results)
 
             logger.info(f"Event-driven backtest completed: {results['backtest_id']}")
             return results
@@ -718,7 +718,7 @@ class BacktestingService:
                 elif strategy_id:
                     query['strategy_id'] = strategy_id
 
-                results = list(self.results_collection.find(query).sort('created_at', -1).limit(50))
+                results = await self.results_collection.find(query).sort('created_at', -1).limit(50).to_list(length=50)
 
                 # Convert ObjectId to string for JSON serialization
                 for result in results:
@@ -773,8 +773,8 @@ class BacktestingService:
             if self.mongo_client:
                 self.mongo_client.close()
 
-            if self.postgres_conn:
-                self.postgres_conn.close()
+            if self.postgres_pool:
+                await self.postgres_pool.close()
 
             logger.info("Backtesting Service cleanup completed")
 

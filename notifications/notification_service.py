@@ -20,6 +20,10 @@ import redis.asyncio as redis
 # Add shared modules to path
 sys.path.append('/app')
 from shared.messaging import MessageConsumer, RabbitMQPublisher
+from shared.exceptions import (
+    NotificationError, TemplateError, DataAccessError,
+    RecoveryStrategy, log_exception_context
+)
 
 # Configure logging
 logging.basicConfig(
@@ -27,6 +31,279 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+class DynamicTemplateManager:
+    """Manages dynamic notification templates with validation and real data integration."""
+
+    def __init__(self):
+        self.templates = {}
+        self.template_cache = {}
+        self.cache_ttl = 3600  # 1 hour cache TTL
+        self.load_default_templates()
+
+    def load_default_templates(self):
+        """Load default configurable templates."""
+        self.templates = {
+            'trade_alert': {
+                'email': {
+                    'subject': 'Trade Alert: {{ side|upper }} {{ symbol }}',
+                    'body': '''
+                    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                        <h2 style="color: #2c3e50;">🔔 Trading Alert</h2>
+                        <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                            <table style="width: 100%; border-collapse: collapse;">
+                                <tr><td style="padding: 8px; font-weight: bold;">Type:</td><td style="padding: 8px;">{{ alert_type }}</td></tr>
+                                <tr><td style="padding: 8px; font-weight: bold;">Strategy:</td><td style="padding: 8px;">{{ strategy_id }}</td></tr>
+                                <tr><td style="padding: 8px; font-weight: bold;">Symbol:</td><td style="padding: 8px;">{{ symbol }}</td></tr>
+                                <tr><td style="padding: 8px; font-weight: bold;">Side:</td><td style="padding: 8px; color: {% if side|lower == 'buy' %}#28a745{% else %}#dc3545{% endif %};">{{ side|upper }}</td></tr>
+                                <tr><td style="padding: 8px; font-weight: bold;">Price:</td><td style="padding: 8px;">${{ "%.4f"|format(price) }}</td></tr>
+                                <tr><td style="padding: 8px; font-weight: bold;">Quantity:</td><td style="padding: 8px;">{{ "%.6f"|format(quantity) }}</td></tr>
+                                <tr><td style="padding: 8px; font-weight: bold;">Value:</td><td style="padding: 8px;">${{ "%.2f"|format(price * quantity) }}</td></tr>
+                                <tr><td style="padding: 8px; font-weight: bold;">Time:</td><td style="padding: 8px;">{{ timestamp }}</td></tr>
+                            </table>
+                            {% if message %}
+                            <div style="margin-top: 15px; padding: 10px; background: #e9ecef; border-radius: 4px;">
+                                <strong>Message:</strong> {{ message }}
+                            </div>
+                            {% endif %}
+                        </div>
+                    </div>
+                    '''
+                },
+                'telegram': '''
+🔔 <b>Trade Alert</b>
+
+📈 <b>Strategy:</b> {{ strategy_id }}
+💱 <b>Symbol:</b> {{ symbol }}
+📊 <b>Side:</b> {{ side|upper }}
+💰 <b>Price:</b> ${{ "%.4f"|format(price) }}
+📦 <b>Quantity:</b> {{ "%.6f"|format(quantity) }}
+💵 <b>Value:</b> ${{ "%.2f"|format(price * quantity) }}
+🕐 <b>Time:</b> {{ timestamp }}
+{% if message %}
+
+💬 <b>Message:</b> {{ message }}
+{% endif %}
+                '''
+            },
+
+            'risk_alert': {
+                'email': {
+                    'subject': 'Risk Alert: {{ alert_type }} ({{ severity|upper }})',
+                    'body': '''
+                    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                        <h2 style="color: #dc3545;">⚠️ Risk Management Alert</h2>
+                        <div style="background: {% if severity == 'high' %}#f8d7da{% elif severity == 'medium' %}#fff3cd{% else %}#d1ecf1{% endif %}; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid {% if severity == 'high' %}#dc3545{% elif severity == 'medium' %}#ffc107{% else %}#17a2b8{% endif %};">
+                            <table style="width: 100%; border-collapse: collapse;">
+                                <tr><td style="padding: 8px; font-weight: bold;">Alert Type:</td><td style="padding: 8px;">{{ alert_type }}</td></tr>
+                                <tr><td style="padding: 8px; font-weight: bold;">Severity:</td><td style="padding: 8px; color: {% if severity == 'high' %}#dc3545{% elif severity == 'medium' %}#ffc107{% else %}#17a2b8{% endif %};">{{ severity|upper }}</td></tr>
+                                <tr><td style="padding: 8px; font-weight: bold;">Time:</td><td style="padding: 8px;">{{ timestamp }}</td></tr>
+                            </table>
+                            <div style="margin-top: 15px; padding: 10px; background: rgba(255,255,255,0.7); border-radius: 4px;">
+                                <strong>Message:</strong> {{ message }}
+                            </div>
+                            {% if details %}
+                            <div style="margin-top: 15px;">
+                                <strong>Details:</strong>
+                                <ul style="margin: 10px 0; padding-left: 20px;">
+                                {% for key, value in details.items() %}
+                                <li><strong>{{ key }}:</strong> {{ value }}</li>
+                                {% endfor %}
+                                </ul>
+                            </div>
+                            {% endif %}
+                        </div>
+                    </div>
+                    '''
+                },
+                'telegram': '''
+⚠️ <b>Risk Alert</b>
+
+🚨 <b>Type:</b> {{ alert_type }}
+📊 <b>Severity:</b> {{ severity|upper }}
+🕐 <b>Time:</b> {{ timestamp }}
+
+💬 <b>Message:</b> {{ message }}
+
+{% if details %}
+<b>Details:</b>
+{% for key, value in details.items() %}
+• <b>{{ key }}:</b> {{ value }}
+{% endfor %}
+{% endif %}
+                '''
+            },
+
+            'daily_summary': {
+                'email': {
+                    'subject': 'Daily Trading Summary - {{ date }}',
+                    'body': '''
+                    <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto;">
+                        <h2 style="color: #2c3e50;">📊 Daily Trading Summary</h2>
+                        <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                            <h3 style="color: #495057;">Overview - {{ date }}</h3>
+                            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0;">
+                                <div style="background: white; padding: 15px; border-radius: 6px; text-align: center;">
+                                    <div style="font-size: 24px; font-weight: bold; color: {% if total_pnl >= 0 %}#28a745{% else %}#dc3545{% endif %};">${{ "%.2f"|format(total_pnl) }}</div>
+                                    <div style="color: #6c757d;">Total P&L</div>
+                                </div>
+                                <div style="background: white; padding: 15px; border-radius: 6px; text-align: center;">
+                                    <div style="font-size: 24px; font-weight: bold; color: #17a2b8;">{{ total_trades }}</div>
+                                    <div style="color: #6c757d;">Total Trades</div>
+                                </div>
+                                <div style="background: white; padding: 15px; border-radius: 6px; text-align: center;">
+                                    <div style="font-size: 24px; font-weight: bold; color: #ffc107;">{{ "%.1f"|format(win_rate) }}%</div>
+                                    <div style="color: #6c757d;">Win Rate</div>
+                                </div>
+                                <div style="background: white; padding: 15px; border-radius: 6px; text-align: center;">
+                                    <div style="font-size: 24px; font-weight: bold; color: #6f42c1;">{{ active_positions }}</div>
+                                    <div style="color: #6c757d;">Active Positions</div>
+                                </div>
+                            </div>
+
+                            {% if strategies %}
+                            <h3 style="color: #495057; margin-top: 30px;">Strategy Performance</h3>
+                            <table style="width: 100%; border-collapse: collapse; background: white; border-radius: 6px; overflow: hidden;">
+                                <thead>
+                                    <tr style="background: #e9ecef;">
+                                        <th style="padding: 12px; text-align: left;">Strategy</th>
+                                        <th style="padding: 12px; text-align: center;">Trades</th>
+                                        <th style="padding: 12px; text-align: center;">P&L</th>
+                                        <th style="padding: 12px; text-align: center;">Win Rate</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                {% for strategy in strategies %}
+                                    <tr style="border-bottom: 1px solid #dee2e6;">
+                                        <td style="padding: 12px;">{{ strategy.name }}</td>
+                                        <td style="padding: 12px; text-align: center;">{{ strategy.trades }}</td>
+                                        <td style="padding: 12px; text-align: center; color: {% if strategy.pnl >= 0 %}#28a745{% else %}#dc3545{% endif %};">${{ "%.2f"|format(strategy.pnl) }}</td>
+                                        <td style="padding: 12px; text-align: center;">{{ "%.1f"|format(strategy.win_rate) }}%</td>
+                                    </tr>
+                                {% endfor %}
+                                </tbody>
+                            </table>
+                            {% endif %}
+                        </div>
+                    </div>
+                    '''
+                },
+                'telegram': '''
+📊 <b>Daily Trading Summary</b>
+📅 <b>Date:</b> {{ date }}
+
+💰 <b>Total P&L:</b> ${{ "%.2f"|format(total_pnl) }}
+📈 <b>Total Trades:</b> {{ total_trades }}
+🎯 <b>Win Rate:</b> {{ "%.1f"|format(win_rate) }}%
+📊 <b>Active Positions:</b> {{ active_positions }}
+
+{% if strategies %}
+<b>Strategy Performance:</b>
+{% for strategy in strategies %}
+• {{ strategy.name }}: {{ strategy.trades }} trades, ${{ "%.2f"|format(strategy.pnl) }} P&L ({{ "%.1f"|format(strategy.win_rate) }}%)
+{% endfor %}
+{% endif %}
+                '''
+            }
+        }
+
+    def get_template(self, template_type: str, format_type: str) -> Template:
+        """Get a template with caching and validation."""
+        try:
+            cache_key = f"{template_type}_{format_type}"
+
+            # Check cache first
+            if cache_key in self.template_cache:
+                cached = self.template_cache[cache_key]
+                if (datetime.now() - cached['timestamp']).seconds < self.cache_ttl:
+                    return cached['template']
+
+            # Get template configuration
+            template_config = self.templates.get(template_type, {})
+            if format_type not in template_config:
+                raise TemplateError(f"Template not found: {template_type}.{format_type}")
+
+            # Create template
+            if format_type == 'email':
+                template_content = template_config[format_type]['body']
+            else:
+                template_content = template_config[format_type]
+
+            template = Template(template_content)
+
+            # Validate template
+            self._validate_template(template, template_type)
+
+            # Cache template
+            self.template_cache[cache_key] = {
+                'template': template,
+                'timestamp': datetime.now()
+            }
+
+            return template
+
+        except Exception as e:
+            log_exception_context(e, {'template_type': template_type, 'format_type': format_type})
+            raise TemplateError(f"Template loading failed: {str(e)}")
+
+    def get_template_subject(self, template_type: str) -> Template:
+        """Get email subject template."""
+        try:
+            template_config = self.templates.get(template_type, {})
+            if 'email' not in template_config or 'subject' not in template_config['email']:
+                return Template(f"Notification: {template_type}")
+
+            return Template(template_config['email']['subject'])
+
+        except Exception as e:
+            log_exception_context(e, {'template_type': template_type})
+            return Template(f"Notification: {template_type}")
+
+    def _validate_template(self, template: Template, template_type: str):
+        """Validate template syntax and required variables."""
+        try:
+            # Test render with dummy data
+            test_data = self._get_test_data(template_type)
+            template.render(**test_data)
+
+        except Exception as e:
+            raise TemplateError(f"Template validation failed for {template_type}: {str(e)}")
+
+    def _get_test_data(self, template_type: str) -> Dict[str, Any]:
+        """Get test data for template validation."""
+        test_data = {
+            'trade_alert': {
+                'alert_type': 'Trade Execution',
+                'strategy_id': 'test_strategy',
+                'symbol': 'BTC/USDT',
+                'side': 'buy',
+                'price': 50000.0,
+                'quantity': 0.001,
+                'timestamp': '2024-01-01 12:00:00',
+                'message': 'Test message'
+            },
+            'risk_alert': {
+                'alert_type': 'Position Size Limit',
+                'severity': 'high',
+                'message': 'Test risk alert',
+                'timestamp': '2024-01-01 12:00:00',
+                'details': {'limit': '10%', 'current': '12%'}
+            },
+            'daily_summary': {
+                'date': '2024-01-01',
+                'total_pnl': 125.50,
+                'total_trades': 8,
+                'win_rate': 62.5,
+                'active_positions': 3,
+                'strategies': [
+                    {'name': 'Test Strategy', 'trades': 3, 'pnl': 45.20, 'win_rate': 66.7}
+                ]
+            }
+        }
+
+        return test_data.get(template_type, {})
+
 
 class NotificationService:
     """Notification service for trading alerts and updates."""
@@ -58,7 +335,16 @@ class NotificationService:
         
         # Redis for rate limiting and deduplication
         self.redis_client = None
-        
+
+        # Database connections for real data
+        self.postgres_url = os.getenv('POSTGRES_URL', 'postgresql://admin:SecureDB2024!@postgresql:5432/trading')
+        self.mongodb_url = os.getenv('MONGODB_URL', 'mongodb://admin:SecureDB2024!@mongodb:27017/trading_data?authSource=admin')
+        self.db_pool = None
+        self.mongo_client = None
+
+        # Template management
+        self.template_manager = DynamicTemplateManager()
+
         # Notification settings
         self.notification_settings = {
             'telegram_enabled': bool(self.telegram_token and self.telegram_chat_id),
@@ -67,15 +353,31 @@ class NotificationService:
             'risk_notifications': True,
             'system_notifications': True,
             'daily_summary': True,
-            'rate_limit_seconds': 60  # Minimum seconds between similar notifications
+            'rate_limit_seconds': 60,  # Minimum seconds between similar notifications
+            'template_validation': True,
+            'real_data_integration': True
         }
-        
+
         # Control flags
         self.running = False
-        
-        # Email templates
-        self.email_templates = self.load_email_templates()
-        
+
+    async def connect_databases(self):
+        """Connect to databases for real data access."""
+        try:
+            # Connect to PostgreSQL
+            import asyncpg
+            self.db_pool = await asyncpg.create_pool(self.postgres_url)
+
+            # Connect to MongoDB
+            import motor.motor_asyncio
+            self.mongo_client = motor.motor_asyncio.AsyncIOMotorClient(self.mongodb_url)
+
+            logger.info("Database connections established for notifications")
+
+        except Exception as e:
+            log_exception_context(e, {'component': 'database_connection'})
+            raise DataAccessError(f"Failed to connect to databases: {str(e)}")
+
     def load_email_templates(self) -> Dict[str, Template]:
         """Load email templates."""
         templates = {
@@ -146,7 +448,11 @@ class NotificationService:
             
             # Connect to Redis
             self.redis_client = redis.from_url(self.redis_url)
-            
+
+            # Connect to databases for real data integration
+            if self.notification_settings['real_data_integration']:
+                await self.connect_databases()
+
             # Initialize Telegram bot
             if self.notification_settings['telegram_enabled']:
                 self.telegram_bot = Bot(token=self.telegram_token)
@@ -421,56 +727,138 @@ class NotificationService:
             logger.error(f"Error processing signal notification: {e}")
 
     async def send_daily_summary(self):
-        """Send daily trading summary."""
+        """Send daily trading summary with real data integration."""
         try:
             if not self.notification_settings['daily_summary']:
                 return
 
-            # Get daily statistics (simplified - would query actual data)
             today = datetime.now().date()
 
-            # Mock data for demonstration
-            daily_stats = {
-                'date': today.strftime('%Y-%m-%d'),
-                'total_pnl': 125.50,
-                'total_trades': 8,
-                'win_rate': 62.5,
-                'active_positions': 3,
-                'strategies': [
-                    {'name': 'MA Crossover', 'trades': 3, 'pnl': 45.20, 'win_rate': 66.7},
-                    {'name': 'RSI Strategy', 'trades': 2, 'pnl': 32.10, 'win_rate': 50.0},
-                    {'name': 'MACD Strategy', 'trades': 3, 'pnl': 48.20, 'win_rate': 66.7}
-                ]
-            }
+            # Get real daily statistics
+            if self.notification_settings['real_data_integration']:
+                daily_stats = await self._get_real_daily_stats(today)
+            else:
+                # Fallback to basic stats
+                daily_stats = await self._get_basic_daily_stats(today)
 
-            # Telegram summary
-            telegram_message = f"""
-📊 <b>Daily Trading Summary</b>
-📅 <b>Date:</b> {daily_stats['date']}
+            # Use dynamic templates
+            try:
+                # Telegram summary
+                telegram_template = self.template_manager.get_template('daily_summary', 'telegram')
+                telegram_message = telegram_template.render(**daily_stats)
+                await self.send_telegram_message(telegram_message)
 
-💰 <b>Total P&L:</b> ${daily_stats['total_pnl']:.2f}
-📈 <b>Total Trades:</b> {daily_stats['total_trades']}
-🎯 <b>Win Rate:</b> {daily_stats['win_rate']:.1f}%
-📦 <b>Active Positions:</b> {daily_stats['active_positions']}
+                # Email summary
+                email_subject_template = self.template_manager.get_template_subject('daily_summary')
+                email_subject = email_subject_template.render(**daily_stats)
 
-<b>Strategy Performance:</b>
-            """
+                email_template = self.template_manager.get_template('daily_summary', 'email')
+                email_content = email_template.render(**daily_stats)
 
-            for strategy in daily_stats['strategies']:
-                telegram_message += f"• {strategy['name']}: {strategy['trades']} trades, ${strategy['pnl']:.2f} P&L\n"
+                await self.send_email(email_subject, email_content)
 
-            await self.send_telegram_message(telegram_message)
-
-            # Email summary
-            email_subject = f"Daily Trading Summary - {daily_stats['date']}"
-            email_content = self.email_templates['daily_summary'].render(**daily_stats)
-
-            await self.send_email(email_subject, email_content)
+            except TemplateError as e:
+                logger.error(f"Template error in daily summary: {e}")
+                # Fallback to simple message
+                await self.send_telegram_message(f"📊 Daily Summary for {daily_stats['date']}: ${daily_stats['total_pnl']:.2f} P&L, {daily_stats['total_trades']} trades")
+                await self.send_email(f"Daily Summary - {daily_stats['date']}", f"<h2>Daily Summary</h2><p>P&L: ${daily_stats['total_pnl']:.2f}</p>")
 
             logger.info("Daily summary sent")
 
         except Exception as e:
-            logger.error(f"Error sending daily summary: {e}")
+            log_exception_context(e, {'component': 'daily_summary'})
+            raise NotificationError(f"Daily summary failed: {str(e)}")
+
+    async def _get_real_daily_stats(self, date) -> Dict[str, Any]:
+        """Get real daily statistics from database."""
+        try:
+            if not self.db_pool:
+                await self.connect_databases()
+
+            async with self.db_pool.acquire() as conn:
+                # Get daily trade statistics
+                trade_stats = await conn.fetchrow("""
+                    SELECT
+                        COUNT(*) as total_trades,
+                        SUM(realized_pnl) as total_pnl,
+                        COUNT(CASE WHEN realized_pnl > 0 THEN 1 END) as winning_trades,
+                        COUNT(CASE WHEN status = 'open' THEN 1 END) as active_positions
+                    FROM trades
+                    WHERE DATE(created_at) = $1
+                """, date)
+
+                # Get strategy performance
+                strategy_stats = await conn.fetch("""
+                    SELECT
+                        strategy_id as name,
+                        COUNT(*) as trades,
+                        SUM(realized_pnl) as pnl,
+                        COUNT(CASE WHEN realized_pnl > 0 THEN 1 END) * 100.0 / COUNT(*) as win_rate
+                    FROM trades
+                    WHERE DATE(created_at) = $1
+                    GROUP BY strategy_id
+                    ORDER BY pnl DESC
+                """, date)
+
+                # Calculate win rate
+                win_rate = 0.0
+                if trade_stats['total_trades'] > 0:
+                    win_rate = (trade_stats['winning_trades'] / trade_stats['total_trades']) * 100
+
+                return {
+                    'date': date.strftime('%Y-%m-%d'),
+                    'total_pnl': float(trade_stats['total_pnl'] or 0),
+                    'total_trades': trade_stats['total_trades'],
+                    'win_rate': win_rate,
+                    'active_positions': trade_stats['active_positions'],
+                    'strategies': [
+                        {
+                            'name': row['name'],
+                            'trades': row['trades'],
+                            'pnl': float(row['pnl'] or 0),
+                            'win_rate': float(row['win_rate'] or 0)
+                        }
+                        for row in strategy_stats
+                    ]
+                }
+
+        except Exception as e:
+            log_exception_context(e, {'date': date})
+            logger.warning(f"Failed to get real daily stats, using fallback: {e}")
+            return await self._get_basic_daily_stats(date)
+
+    async def _get_basic_daily_stats(self, date) -> Dict[str, Any]:
+        """Get basic daily statistics as fallback."""
+        try:
+            # Try to get some basic stats from Redis cache
+            if self.redis_client:
+                cache_key = f"daily_stats:{date.strftime('%Y-%m-%d')}"
+                cached_stats = await self.redis_client.get(cache_key)
+                if cached_stats:
+                    import json
+                    return json.loads(cached_stats)
+
+            # Ultimate fallback - return minimal stats
+            return {
+                'date': date.strftime('%Y-%m-%d'),
+                'total_pnl': 0.0,
+                'total_trades': 0,
+                'win_rate': 0.0,
+                'active_positions': 0,
+                'strategies': []
+            }
+
+        except Exception as e:
+            log_exception_context(e, {'date': date})
+            # Return minimal stats
+            return {
+                'date': date.strftime('%Y-%m-%d'),
+                'total_pnl': 0.0,
+                'total_trades': 0,
+                'win_rate': 0.0,
+                'active_positions': 0,
+                'strategies': []
+            }
 
     async def process_system_notification(self, event: Dict[str, Any]):
         """Process system event notification."""

@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "context7": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@upstash/context7-mcp@latest"
+      ]
+    },
+    "vertex-ai-mcp-server": {
+      "command": "node",
+      "args": [
+        "D:\\GitProjects\\vertex-ai-mcp-server\\build/index.js"
+      ],
+      "env": {
+        "GOOGLE_CLOUD_PROJECT": "rooproject-459116"
+      }
+    }
+  }
+}

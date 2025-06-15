@@ -19,8 +19,8 @@ services:
       - "5672:5672"
       - "15672:15672"
     environment:
-      - RABBITMQ_DEFAULT_USER=admin
-      - RABBITMQ_DEFAULT_PASS=SecureRabbit2024!
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_DEFAULT_USER:-admin}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS:-SecureRabbit2024!}
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     networks:
@@ -32,9 +32,9 @@ services:
     ports:
       - "5432:5432"
     environment:
-      - POSTGRES_DB=trading
-      - POSTGRES_USER=admin
-      - POSTGRES_PASSWORD=SecureDB2024!
+      - POSTGRES_DB=${POSTGRES_DB:-trading}
+      - POSTGRES_USER=${POSTGRES_USER:-admin}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-SecureDB2024!}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./config/init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -47,10 +47,56 @@ services:
     ports:
       - "27017:27017"
     environment:
-      - MONGO_INITDB_ROOT_USERNAME=admin
-      - MONGO_INITDB_ROOT_PASSWORD=SecureDB2024!
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME:-admin}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD:-SecureDB2024!}
     volumes:
       - mongo_data:/data/db
+    networks:
+      - trading_net
+    restart: unless-stopped
+
+  # Monitoring Services
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - trading_net
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+    networks:
+      - trading_net
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"
+      - "14268:14268"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
     networks:
       - trading_net
     restart: unless-stopped
@@ -58,11 +104,13 @@ services:
   # Core Trading Services
   market_data:
     build:
-      context: ./market_data
-      dockerfile: Containerfile
+      context: .
+      dockerfile: market_data/Containerfile
     environment:
-      - REDIS_URL=redis://redis:6379
-      - MONGODB_URL=mongodb://admin:SecureDB2024!@mongodb:27017/trading_data?authSource=admin
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - MONGODB_URL=mongodb://${MONGO_INITDB_ROOT_USERNAME:-admin}:${MONGO_INITDB_ROOT_PASSWORD:-SecureDB2024!}@mongodb:27017/trading_data?authSource=admin
+    ports:
+      - "8080:8080"  # Health check endpoint
     depends_on:
       - redis
       - mongodb
@@ -72,12 +120,12 @@ services:
 
   strategy_engine:
     build:
-      context: ./strategy_engine
-      dockerfile: Containerfile
+      context: .
+      dockerfile: strategy_engine/Containerfile
     environment:
-      - REDIS_URL=redis://redis:6379
-      - RABBITMQ_URL=amqp://admin:SecureRabbit2024!@rabbitmq:5672/
-      - MONGODB_URL=mongodb://admin:SecureDB2024!@mongodb:27017/trading_data?authSource=admin
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER:-admin}:${RABBITMQ_DEFAULT_PASS:-SecureRabbit2024!}@rabbitmq:5672/
+      - MONGODB_URL=mongodb://${MONGO_INITDB_ROOT_USERNAME:-admin}:${MONGO_INITDB_ROOT_PASSWORD:-SecureDB2024!}@mongodb:27017/trading_data?authSource=admin
     depends_on:
       - redis
       - rabbitmq
@@ -89,11 +137,11 @@ services:
 
   risk_management:
     build:
-      context: ./risk_management
-      dockerfile: Containerfile
+      context: .
+      dockerfile: risk_management/Containerfile
     environment:
-      - RABBITMQ_URL=amqp://admin:SecureRabbit2024!@rabbitmq:5672/
-      - POSTGRES_URL=postgresql://admin:SecureDB2024!@postgresql:5432/trading
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER:-admin}:${RABBITMQ_DEFAULT_PASS:-SecureRabbit2024!}@rabbitmq:5672/
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-SecureDB2024!}@postgresql:5432/${POSTGRES_DB:-trading}
     depends_on:
       - rabbitmq
       - postgresql
@@ -103,11 +151,11 @@ services:
 
   execution_gateway:
     build:
-      context: ./execution_gateway
-      dockerfile: Containerfile
+      context: .
+      dockerfile: execution_gateway/Containerfile
     environment:
-      - RABBITMQ_URL=amqp://admin:SecureRabbit2024!@rabbitmq:5672/
-      - MONGODB_URL=mongodb://admin:SecureDB2024!@mongodb:27017/trading_data?authSource=admin
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER:-admin}:${RABBITMQ_DEFAULT_PASS:-SecureRabbit2024!}@rabbitmq:5672/
+      - MONGODB_URL=mongodb://${MONGO_INITDB_ROOT_USERNAME:-admin}:${MONGO_INITDB_ROOT_PASSWORD:-SecureDB2024!}@mongodb:27017/trading_data?authSource=admin
     depends_on:
       - rabbitmq
       - mongodb
@@ -117,11 +165,11 @@ services:
 
   portfolio_accounting:
     build:
-      context: ./portfolio_accounting
-      dockerfile: Containerfile
+      context: .
+      dockerfile: portfolio_accounting/Containerfile
     environment:
-      - RABBITMQ_URL=amqp://admin:SecureRabbit2024!@rabbitmq:5672/
-      - POSTGRES_URL=postgresql://admin:SecureDB2024!@postgresql:5432/trading
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER:-admin}:${RABBITMQ_DEFAULT_PASS:-SecureRabbit2024!}@rabbitmq:5672/
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-SecureDB2024!}@postgresql:5432/${POSTGRES_DB:-trading}
     depends_on:
       - rabbitmq
       - postgresql
@@ -131,11 +179,11 @@ services:
 
   trade_logger:
     build:
-      context: ./trade_logger
-      dockerfile: Containerfile
+      context: .
+      dockerfile: trade_logger/Containerfile
     environment:
-      - RABBITMQ_URL=amqp://admin:SecureRabbit2024!@rabbitmq:5672/
-      - MONGODB_URL=mongodb://admin:SecureDB2024!@mongodb:27017/trading_data?authSource=admin
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER:-admin}:${RABBITMQ_DEFAULT_PASS:-SecureRabbit2024!}@rabbitmq:5672/
+      - MONGODB_URL=mongodb://${MONGO_INITDB_ROOT_USERNAME:-admin}:${MONGO_INITDB_ROOT_PASSWORD:-SecureDB2024!}@mongodb:27017/trading_data?authSource=admin
     depends_on:
       - rabbitmq
       - mongodb
@@ -145,8 +193,8 @@ services:
 
   notifications:
     build:
-      context: ./notifications
-      dockerfile: Containerfile
+      context: .
+      dockerfile: notifications/Containerfile
     environment:
       - RABBITMQ_URL=amqp://admin:SecureRabbit2024!@rabbitmq:5672/
       - REDIS_URL=redis://redis:6379
@@ -167,12 +215,12 @@ services:
 
   backtesting:
     build:
-      context: ./backtesting
-      dockerfile: Containerfile
+      context: .
+      dockerfile: backtesting/Containerfile
     environment:
-      - MONGODB_URL=mongodb://admin:SecureDB2024!@mongodb:27017/trading_data?authSource=admin
-      - POSTGRES_URL=postgresql://admin:SecureDB2024!@postgresql:5432/trading
-      - RABBITMQ_URL=amqp://admin:SecureRabbit2024!@rabbitmq:5672/
+      - MONGODB_URL=mongodb://${MONGO_INITDB_ROOT_USERNAME:-admin}:${MONGO_INITDB_ROOT_PASSWORD:-SecureDB2024!}@mongodb:27017/trading_data?authSource=admin
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-SecureDB2024!}@postgresql:5432/${POSTGRES_DB:-trading}
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER:-admin}:${RABBITMQ_DEFAULT_PASS:-SecureRabbit2024!}@rabbitmq:5672/
     depends_on:
       - mongodb
       - postgresql
@@ -183,19 +231,35 @@ services:
 
   ui_gateway:
     build:
-      context: ./ui_gateway
-      dockerfile: Containerfile
+      context: .
+      dockerfile: ui_gateway/Containerfile
     ports:
-      - "8501:8501"
+      - "8501:8501"  # Streamlit
+      - "8765:8765"  # WebSocket
     environment:
-      - REDIS_URL=redis://redis:6379
-      - POSTGRES_URL=postgresql://admin:SecureDB2024!@postgresql:5432/trading
-      - MONGODB_URL=mongodb://admin:SecureDB2024!@mongodb:27017/trading_data?authSource=admin
-      - RABBITMQ_URL=amqp://admin:SecureRabbit2024!@rabbitmq:5672/
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-SecureDB2024!}@postgresql:5432/${POSTGRES_DB:-trading}
+      - MONGODB_URL=mongodb://${MONGO_INITDB_ROOT_USERNAME:-admin}:${MONGO_INITDB_ROOT_PASSWORD:-SecureDB2024!}@mongodb:27017/trading_data?authSource=admin
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER:-admin}:${RABBITMQ_DEFAULT_PASS:-SecureRabbit2024!}@rabbitmq:5672/
+      - WEBSOCKET_URL=ws://localhost:8765
     depends_on:
       - redis
       - postgresql
       - mongodb
+      - rabbitmq
+    networks:
+      - trading_net
+    restart: unless-stopped
+
+  outbox_publisher:
+    build:
+      context: .
+      dockerfile: outbox_publisher/Containerfile
+    environment:
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-SecureDB2024!}@postgresql:5432/${POSTGRES_DB:-trading}
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER:-admin}:${RABBITMQ_DEFAULT_PASS:-SecureRabbit2024!}@rabbitmq:5672/
+    depends_on:
+      - postgresql
       - rabbitmq
     networks:
       - trading_net
@@ -206,6 +270,8 @@ volumes:
   rabbitmq_data:
   postgres_data:
   mongo_data:
+  prometheus_data:
+  grafana_data:
 
 networks:
   trading_net:

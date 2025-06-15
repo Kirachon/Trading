@@ -9,8 +9,7 @@ import sys
 import json
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
-import pymongo
-from pymongo import MongoClient
+from motor.motor_asyncio import AsyncIOMotorClient
 import pandas as pd
 
 # Add shared modules to path
@@ -67,12 +66,15 @@ class TradeLoggerService:
             await self.rabbitmq_publisher.connect()
             await self.command_consumer.connect()
             
-            # Connect to MongoDB
-            self.mongo_client = MongoClient(self.mongodb_url)
+            # Connect to MongoDB using Motor (async)
+            self.mongo_client = AsyncIOMotorClient(self.mongodb_url)
             self.db = self.mongo_client['trading_logs']
-            
+
+            # Test the connection
+            await self.mongo_client.admin.command('ping')
+
             # Initialize collections
-            self.setup_collections()
+            await self.setup_collections()
             
             logger.info("Trade Logger Service initialized successfully")
             
@@ -80,48 +82,48 @@ class TradeLoggerService:
             logger.error(f"Failed to initialize Trade Logger Service: {e}")
             raise
     
-    def setup_collections(self):
+    async def setup_collections(self):
         """Set up MongoDB collections with proper indexes."""
         try:
             # Initialize collections
             for collection_name in self.collections.keys():
                 self.collections[collection_name] = self.db[collection_name]
-            
-            # Create indexes for efficient querying
-            
+
+            # Create indexes for efficient querying (async)
+
             # Fills collection indexes
-            self.collections['fills'].create_index([("timestamp", 1)])
-            self.collections['fills'].create_index([("exchange", 1), ("symbol", 1)])
-            self.collections['fills'].create_index([("strategy_id", 1)])
-            self.collections['fills'].create_index([("order_id", 1)])
-            
+            await self.collections['fills'].create_index([("timestamp", 1)])
+            await self.collections['fills'].create_index([("exchange", 1), ("symbol", 1)])
+            await self.collections['fills'].create_index([("strategy_id", 1)])
+            await self.collections['fills'].create_index([("order_id", 1)])
+
             # Signals collection indexes
-            self.collections['signals'].create_index([("timestamp", 1)])
-            self.collections['signals'].create_index([("strategy_id", 1)])
-            self.collections['signals'].create_index([("symbol", 1)])
-            self.collections['signals'].create_index([("side", 1)])
-            
+            await self.collections['signals'].create_index([("timestamp", 1)])
+            await self.collections['signals'].create_index([("strategy_id", 1)])
+            await self.collections['signals'].create_index([("symbol", 1)])
+            await self.collections['signals'].create_index([("side", 1)])
+
             # Alerts collection indexes
-            self.collections['alerts'].create_index([("timestamp", 1)])
-            self.collections['alerts'].create_index([("type", 1)])
-            self.collections['alerts'].create_index([("severity", 1)])
-            
+            await self.collections['alerts'].create_index([("timestamp", 1)])
+            await self.collections['alerts'].create_index([("type", 1)])
+            await self.collections['alerts'].create_index([("severity", 1)])
+
             # Portfolio updates indexes
-            self.collections['portfolio_updates'].create_index([("timestamp", 1)])
-            self.collections['portfolio_updates'].create_index([("trade_id", 1)])
-            
+            await self.collections['portfolio_updates'].create_index([("timestamp", 1)])
+            await self.collections['portfolio_updates'].create_index([("trade_id", 1)])
+
             # System events indexes
-            self.collections['system_events'].create_index([("timestamp", 1)])
-            self.collections['system_events'].create_index([("service", 1)])
-            self.collections['system_events'].create_index([("event_type", 1)])
-            
+            await self.collections['system_events'].create_index([("timestamp", 1)])
+            await self.collections['system_events'].create_index([("service", 1)])
+            await self.collections['system_events'].create_index([("event_type", 1)])
+
             # Performance logs indexes
-            self.collections['performance_logs'].create_index([("timestamp", 1)])
-            self.collections['performance_logs'].create_index([("strategy_id", 1)])
-            self.collections['performance_logs'].create_index([("date", 1)])
-            
+            await self.collections['performance_logs'].create_index([("timestamp", 1)])
+            await self.collections['performance_logs'].create_index([("strategy_id", 1)])
+            await self.collections['performance_logs'].create_index([("date", 1)])
+
             logger.info("MongoDB collections and indexes set up successfully")
-            
+
         except Exception as e:
             logger.error(f"Error setting up collections: {e}")
             raise
@@ -140,8 +142,8 @@ class TradeLoggerService:
             }
             
             # Insert into fills collection
-            result = self.collections['fills'].insert_one(enhanced_fill)
-            
+            result = await self.collections['fills'].insert_one(enhanced_fill)
+
             logger.info(f"Logged fill event: {fill_event.get('order_id', 'unknown')} - {result.inserted_id}")
             
             # Generate performance analytics
@@ -164,8 +166,8 @@ class TradeLoggerService:
             }
             
             # Insert into signals collection
-            result = self.collections['signals'].insert_one(enhanced_signal)
-            
+            result = await self.collections['signals'].insert_one(enhanced_signal)
+
             logger.debug(f"Logged signal: {signal.get('strategy_id', 'unknown')} {signal.get('side', 'unknown')} - {result.inserted_id}")
             
         except Exception as e:
@@ -185,8 +187,8 @@ class TradeLoggerService:
             }
             
             # Insert into alerts collection
-            result = self.collections['alerts'].insert_one(enhanced_alert)
-            
+            result = await self.collections['alerts'].insert_one(enhanced_alert)
+
             logger.info(f"Logged alert: {alert.get('type', 'unknown')} - {result.inserted_id}")
             
         except Exception as e:
@@ -203,8 +205,8 @@ class TradeLoggerService:
             }
             
             # Insert into portfolio updates collection
-            result = self.collections['portfolio_updates'].insert_one(enhanced_update)
-            
+            result = await self.collections['portfolio_updates'].insert_one(enhanced_update)
+
             logger.debug(f"Logged portfolio update: {update.get('trade_id', 'unknown')} - {result.inserted_id}")
             
         except Exception as e:
@@ -223,8 +225,8 @@ class TradeLoggerService:
             }
             
             # Insert into system events collection
-            result = self.collections['system_events'].insert_one(enhanced_event)
-            
+            result = await self.collections['system_events'].insert_one(enhanced_event)
+
             logger.info(f"Logged system event: {event.get('event_type', 'unknown')} - {result.inserted_id}")
             
         except Exception as e:
@@ -289,10 +291,10 @@ class TradeLoggerService:
             today_start = datetime.combine(today, datetime.min.time())
             today_end = datetime.combine(today, datetime.max.time())
             
-            fills_today = list(self.collections['fills'].find({
+            fills_today = await self.collections['fills'].find({
                 'strategy_id': strategy_id,
                 'logged_at': {'$gte': today_start, '$lte': today_end}
-            }))
+            }).to_list(length=None)
             
             if fills_today:
                 # Calculate metrics
@@ -317,7 +319,7 @@ class TradeLoggerService:
                 }
                 
                 # Upsert performance log
-                self.collections['performance_logs'].replace_one(
+                await self.collections['performance_logs'].replace_one(
                     {'strategy_id': strategy_id, 'date': today},
                     performance_log,
                     upsert=True
@@ -349,7 +351,7 @@ class TradeLoggerService:
                 query['logged_at']['$lte'] = filters['end_date']
             
             # Get fills with query
-            fills = list(self.collections['fills'].find(query).sort('logged_at', -1).limit(1000))
+            fills = await self.collections['fills'].find(query).sort('logged_at', -1).limit(1000).to_list(length=1000)
             
             # Convert ObjectId to string for JSON serialization
             for fill in fills:
@@ -439,12 +441,12 @@ class TradeLoggerService:
             # Clean up old logs from each collection
             for collection_name, collection in self.collections.items():
                 if collection_name != 'performance_logs':  # Keep performance logs longer
-                    result = collection.delete_many({'logged_at': {'$lt': cutoff_date}})
+                    result = await collection.delete_many({'logged_at': {'$lt': cutoff_date}})
                     logger.info(f"Cleaned up {result.deleted_count} old records from {collection_name}")
-            
+
             # Clean up very old performance logs (keep 1 year)
             old_cutoff = datetime.now() - timedelta(days=365)
-            result = self.collections['performance_logs'].delete_many({'last_updated': {'$lt': old_cutoff}})
+            result = await self.collections['performance_logs'].delete_many({'last_updated': {'$lt': old_cutoff}})
             logger.info(f"Cleaned up {result.deleted_count} old performance logs")
             
         except Exception as e:

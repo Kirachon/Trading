@@ -10,14 +10,18 @@ import json
 import uuid
 from datetime import datetime
 from typing import Dict, Any, Optional, List
-import pymongo
-from pymongo import MongoClient
+import motor.motor_asyncio
+from motor.motor_asyncio import AsyncIOMotorClient
 
 # Add shared modules to path
 sys.path.append('/app')
 from shared.messaging import MessageConsumer, RabbitMQPublisher
 from shared.exchange_factory import get_exchange
 from shared.rate_limiter import ExchangeRateLimiters
+from shared.exceptions import (
+    TradingSystemError, ExecutionError, OrderRejectedError, OrderTimeoutError,
+    InsufficientLiquidityError, RecoveryStrategy, log_exception_context
+)
 
 # Configure logging
 logging.basicConfig(
@@ -25,6 +29,42 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+class AtomicOrderGroup:
+    """Manages a group of related orders that should be executed atomically."""
+
+    def __init__(self, group_id: str, strategy_id: str, symbol: str):
+        self.group_id = group_id
+        self.strategy_id = strategy_id
+        self.symbol = symbol
+        self.orders = {}  # order_type -> order_info
+        self.state = 'pending'  # pending, executing, completed, failed, cancelled
+        self.created_at = datetime.now()
+        self.updated_at = datetime.now()
+
+    def add_order(self, order_type: str, order_info: Dict[str, Any]):
+        """Add an order to the group."""
+        self.orders[order_type] = order_info
+        self.updated_at = datetime.now()
+
+    def get_order(self, order_type: str) -> Optional[Dict[str, Any]]:
+        """Get an order from the group."""
+        return self.orders.get(order_type)
+
+    def update_state(self, new_state: str):
+        """Update the group state."""
+        self.state = new_state
+        self.updated_at = datetime.now()
+
+    def is_complete(self) -> bool:
+        """Check if all orders in the group are complete."""
+        return self.state in ['completed', 'failed', 'cancelled']
+
+    def get_active_orders(self) -> List[Dict[str, Any]]:
+        """Get all active orders in the group."""
+        return [order for order in self.orders.values() if order.get('status') not in ['closed', 'canceled', 'expired']]
+
 
 class ExecutionGateway:
     """Execution gateway for placing and managing orders on exchanges."""
@@ -47,7 +87,11 @@ class ExecutionGateway:
         
         # Active orders tracking
         self.active_orders = {}  # order_id -> order_info
-        
+        self.order_groups = {}   # group_id -> list of related orders (for atomic operations)
+
+        # Order state management
+        self.order_states = {}   # order_id -> state_info
+
         # Control flags
         self.running = False
         self.execution_enabled = True
@@ -67,16 +111,19 @@ class ExecutionGateway:
             await self.rabbitmq_publisher.connect()
             await self.command_consumer.connect()
             
-            # Connect to MongoDB
-            self.mongo_client = MongoClient(self.mongodb_url)
+            # Connect to MongoDB using Motor (async)
+            self.mongo_client = AsyncIOMotorClient(self.mongodb_url)
             self.db = self.mongo_client['trading_data']
-            
-            # Create indexes for orders collection
-            self.db.orders.create_index("order_id", unique=True)
-            self.db.orders.create_index("exchange_id")
-            self.db.orders.create_index("symbol")
-            self.db.orders.create_index("status")
-            self.db.orders.create_index("timestamp")
+
+            # Test the connection
+            await self.mongo_client.admin.command('ping')
+
+            # Create indexes for orders collection (async)
+            await self.db.orders.create_index("order_id", unique=True)
+            await self.db.orders.create_index("exchange_id")
+            await self.db.orders.create_index("symbol")
+            await self.db.orders.create_index("status")
+            await self.db.orders.create_index("timestamp")
             
             logger.info("Execution Gateway initialized successfully")
             
@@ -154,38 +201,55 @@ class ExecutionGateway:
             logger.error(f"Error placing limit order: {e}")
             return None
     
-    async def place_oco_order(self, exchange, signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Place an OCO (One-Cancels-Other) order with stop loss and take profit."""
+    async def place_atomic_order_group(self, exchange, signal: Dict[str, Any]) -> Optional[AtomicOrderGroup]:
+        """Place an atomic order group with proper exit order management."""
+        group_id = str(uuid.uuid4())
+        order_group = AtomicOrderGroup(group_id, signal['strategy_id'], signal['symbol'])
+
         try:
             symbol = signal['symbol']
             side = signal['side']
             current_price = signal['price']
-            
+
             # Get stop loss and take profit from signal
             stop_loss = signal.get('stop_loss')
             take_profit = signal.get('take_profit')
-            
+
             if not stop_loss or not take_profit:
-                logger.warning(f"Missing stop loss or take profit for OCO order: {signal}")
-                return await self.place_market_order(exchange, signal)
-            
+                logger.warning(f"Missing stop loss or take profit for atomic order group: {signal}")
+                # Fall back to simple market order
+                entry_order = await self.place_market_order(exchange, signal)
+                if entry_order:
+                    order_group.add_order('entry', entry_order)
+                    order_group.update_state('completed')
+                return order_group
+
             # Calculate quantity
             quantity = self.calculate_order_quantity(signal, current_price)
-            
+
             if quantity <= 0:
-                logger.error(f"Invalid quantity {quantity} for {symbol}")
-                return None
-            
-            # First place the entry order (market order)
-            entry_order = await exchange.create_market_order(symbol, side, quantity)
-            
-            if not entry_order:
-                return None
-            
-            # Then place OCO order for exit
+                raise ExecutionError(f"Invalid quantity {quantity} for {symbol}")
+
+            order_group.update_state('executing')
+
+            # Step 1: Place the entry order (market order)
+            try:
+                entry_order = await exchange.create_market_order(symbol, side, quantity)
+                if not entry_order:
+                    raise ExecutionError("Failed to place entry order")
+
+                order_group.add_order('entry', entry_order)
+                logger.info(f"Placed entry order: {entry_order['id']} for group {group_id}")
+
+            except Exception as e:
+                order_group.update_state('failed')
+                log_exception_context(e, {'group_id': group_id, 'step': 'entry_order'})
+                raise ExecutionError(f"Entry order failed: {str(e)}")
+
+            # Step 2: Place exit orders atomically
             exit_side = 'sell' if side == 'buy' else 'buy'
-            
-            # Check if exchange supports OCO orders
+
+            # Try native OCO first if supported
             if exchange.has.get('createOrder') and 'oco' in str(exchange.describe()):
                 try:
                     oco_order = await exchange.create_order(
@@ -195,33 +259,68 @@ class ExecutionGateway:
                             'stopLimitPrice': stop_loss * 0.99 if side == 'buy' else stop_loss * 1.01
                         }
                     )
-                    logger.info(f"Placed OCO order: {oco_order['id']}")
-                    return {'entry': entry_order, 'oco': oco_order}
+                    order_group.add_order('oco', oco_order)
+                    order_group.update_state('completed')
+                    logger.info(f"Placed native OCO order: {oco_order['id']} for group {group_id}")
+                    return order_group
+
                 except Exception as e:
-                    logger.warning(f"OCO order failed, placing separate orders: {e}")
-            
-            # Fallback: place separate stop loss and take profit orders
+                    logger.warning(f"Native OCO failed for group {group_id}, using managed exit orders: {e}")
+
+            # Step 3: Use managed exit orders with proper cancellation logic
             try:
+                # Place both exit orders
                 stop_order = await exchange.create_stop_limit_order(
-                    symbol, exit_side, quantity, stop_loss, stop_loss * 0.99 if side == 'buy' else stop_loss * 1.01
+                    symbol, exit_side, quantity, stop_loss,
+                    stop_loss * 0.99 if side == 'buy' else stop_loss * 1.01
                 )
-                
+
                 tp_order = await exchange.create_limit_order(
                     symbol, exit_side, quantity, take_profit
                 )
-                
-                return {
-                    'entry': entry_order,
-                    'stop_loss': stop_order,
-                    'take_profit': tp_order
-                }
-                
+
+                if not stop_order or not tp_order:
+                    # If either order failed, cancel the successful one
+                    if stop_order:
+                        await exchange.cancel_order(stop_order['id'], symbol)
+                    if tp_order:
+                        await exchange.cancel_order(tp_order['id'], symbol)
+                    raise ExecutionError("Failed to place both exit orders atomically")
+
+                order_group.add_order('stop_loss', stop_order)
+                order_group.add_order('take_profit', tp_order)
+                order_group.update_state('completed')
+
+                logger.info(f"Placed managed exit orders for group {group_id}: SL={stop_order['id']}, TP={tp_order['id']}")
+                return order_group
+
             except Exception as e:
-                logger.error(f"Failed to place exit orders: {e}")
-                return {'entry': entry_order}
-            
+                order_group.update_state('failed')
+                log_exception_context(e, {'group_id': group_id, 'step': 'exit_orders'})
+                raise ExecutionError(f"Exit orders failed: {str(e)}")
+
+        except ExecutionError:
+            # Re-raise execution errors
+            raise
         except Exception as e:
-            logger.error(f"Error placing OCO order: {e}")
+            order_group.update_state('failed')
+            log_exception_context(e, {'group_id': group_id})
+            raise ExecutionError(f"Atomic order group failed: {str(e)}")
+
+    async def place_oco_order(self, exchange, signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Legacy OCO method - now uses atomic order groups."""
+        try:
+            order_group = await self.place_atomic_order_group(exchange, signal)
+            if order_group and order_group.state == 'completed':
+                # Convert to legacy format for compatibility
+                result = {}
+                for order_type, order in order_group.orders.items():
+                    result[order_type] = order
+                return result
+            return None
+
+        except Exception as e:
+            log_exception_context(e, {'signal': signal})
             return None
     
     async def execute_signal(self, signal: Dict[str, Any]):
@@ -267,11 +366,27 @@ class ExecutionGateway:
                 # Publish fill event
                 await self.publish_fill_event(signal, order_result)
                 
-                # Track active orders
-                if isinstance(order_result, dict) and 'id' in order_result:
+                # Track active orders and order groups
+                if isinstance(order_result, AtomicOrderGroup):
+                    # Track the order group
+                    self.order_groups[order_result.group_id] = order_result
+
+                    # Track individual orders within the group
+                    for order_type, order in order_result.orders.items():
+                        if order and 'id' in order:
+                            self.active_orders[order['id']] = {
+                                'signal': signal,
+                                'order': order,
+                                'order_type': order_type,
+                                'group_id': order_result.group_id,
+                                'timestamp': datetime.now()
+                            }
+                elif isinstance(order_result, dict) and 'id' in order_result:
                     self.active_orders[order_result['id']] = {
                         'signal': signal,
                         'order': order_result,
+                        'order_type': 'single',
+                        'group_id': None,
                         'timestamp': datetime.now()
                     }
             
@@ -319,7 +434,7 @@ class ExecutionGateway:
                     'exchange_response': order
                 }
                 
-                self.db.orders.insert_one(order_doc)
+                await self.db.orders.insert_one(order_doc)
                 logger.debug(f"Stored order info: {order_doc['order_id']}")
             
         except Exception as e:
@@ -365,48 +480,148 @@ class ExecutionGateway:
             logger.error(f"Error publishing fill event: {e}")
     
     async def monitor_orders(self):
-        """Monitor active orders for status updates."""
+        """Monitor active orders and order groups for status updates."""
         try:
-            if not self.active_orders:
+            if not self.active_orders and not self.order_groups:
                 return
-            
-            # Check order status periodically
-            orders_to_remove = []
-            
-            for order_id, order_info in self.active_orders.items():
-                try:
-                    signal = order_info['signal']
-                    exchange = await get_exchange(signal['exchange'], use_testnet=True)
-                    
-                    # Fetch order status
-                    order_status = await exchange.fetch_order(order_id, signal['symbol'])
-                    
-                    if order_status['status'] in ['closed', 'canceled', 'expired']:
-                        # Order is complete, remove from tracking
-                        orders_to_remove.append(order_id)
-                        
-                        # Update order in database
-                        self.db.orders.update_one(
-                            {'order_id': order_id},
-                            {'$set': {
-                                'status': order_status['status'],
-                                'filled_quantity': order_status.get('filled', 0),
-                                'remaining_quantity': order_status.get('remaining', 0),
-                                'updated_at': datetime.now()
-                            }}
-                        )
-                        
-                        logger.info(f"Order {order_id} completed with status: {order_status['status']}")
-                
-                except Exception as e:
-                    logger.error(f"Error monitoring order {order_id}: {e}")
-            
-            # Remove completed orders
-            for order_id in orders_to_remove:
-                del self.active_orders[order_id]
-                
+
+            # Monitor individual orders
+            await self._monitor_individual_orders()
+
+            # Monitor order groups for exit order management
+            await self._monitor_order_groups()
+
         except Exception as e:
-            logger.error(f"Error in order monitoring: {e}")
+            log_exception_context(e, {'component': 'order_monitoring'})
+
+    async def _monitor_individual_orders(self):
+        """Monitor individual order status updates."""
+        orders_to_remove = []
+
+        for order_id, order_info in self.active_orders.items():
+            try:
+                signal = order_info['signal']
+                exchange = await get_exchange(signal['exchange'], use_testnet=True)
+
+                # Fetch order status
+                order_status = await exchange.fetch_order(order_id, signal['symbol'])
+
+                if order_status['status'] in ['closed', 'canceled', 'expired']:
+                    # Order is complete, remove from tracking
+                    orders_to_remove.append(order_id)
+
+                    # Update order in database
+                    await self.db.orders.update_one(
+                        {'order_id': order_id},
+                        {'$set': {
+                            'status': order_status['status'],
+                            'filled_quantity': order_status.get('filled', 0),
+                            'remaining_quantity': order_status.get('remaining', 0),
+                            'updated_at': datetime.now()
+                        }}
+                    )
+
+                    logger.info(f"Order {order_id} completed with status: {order_status['status']}")
+
+                    # Handle order group implications
+                    group_id = order_info.get('group_id')
+                    if group_id and group_id in self.order_groups:
+                        await self._handle_order_completion_in_group(group_id, order_id, order_status, exchange)
+
+            except Exception as e:
+                log_exception_context(e, {'order_id': order_id})
+
+        # Remove completed orders
+        for order_id in orders_to_remove:
+            del self.active_orders[order_id]
+
+    async def _monitor_order_groups(self):
+        """Monitor order groups for proper exit order management."""
+        groups_to_remove = []
+
+        for group_id, order_group in self.order_groups.items():
+            try:
+                if order_group.is_complete():
+                    continue
+
+                # Check if any exit orders need to be cancelled due to the other being filled
+                await self._manage_exit_order_cancellation(order_group)
+
+                # Check if group should be marked as complete
+                active_orders = order_group.get_active_orders()
+                if not active_orders:
+                    order_group.update_state('completed')
+                    groups_to_remove.append(group_id)
+                    logger.info(f"Order group {group_id} completed")
+
+            except Exception as e:
+                log_exception_context(e, {'group_id': group_id})
+
+        # Remove completed groups
+        for group_id in groups_to_remove:
+            del self.order_groups[group_id]
+
+    async def _handle_order_completion_in_group(self, group_id: str, completed_order_id: str,
+                                              order_status: Dict[str, Any], exchange):
+        """Handle order completion within an order group."""
+        try:
+            order_group = self.order_groups.get(group_id)
+            if not order_group:
+                return
+
+            # Find the completed order type
+            completed_order_type = None
+            for order_type, order in order_group.orders.items():
+                if order and order.get('id') == completed_order_id:
+                    completed_order_type = order_type
+                    break
+
+            if not completed_order_type:
+                return
+
+            # If an exit order was filled, cancel the other exit order
+            if completed_order_type in ['stop_loss', 'take_profit'] and order_status['status'] == 'closed':
+                await self._cancel_other_exit_orders(order_group, completed_order_type, exchange)
+
+        except Exception as e:
+            log_exception_context(e, {'group_id': group_id, 'completed_order_id': completed_order_id})
+
+    async def _cancel_other_exit_orders(self, order_group: AtomicOrderGroup,
+                                      filled_order_type: str, exchange):
+        """Cancel other exit orders when one is filled."""
+        try:
+            symbol = order_group.symbol
+
+            # Cancel the other exit order
+            other_order_type = 'take_profit' if filled_order_type == 'stop_loss' else 'stop_loss'
+            other_order = order_group.get_order(other_order_type)
+
+            if other_order and other_order.get('id'):
+                try:
+                    await exchange.cancel_order(other_order['id'], symbol)
+                    logger.info(f"Cancelled {other_order_type} order {other_order['id']} in group {order_group.group_id}")
+
+                    # Update database
+                    await self.db.orders.update_one(
+                        {'order_id': other_order['id']},
+                        {'$set': {
+                            'status': 'canceled',
+                            'updated_at': datetime.now(),
+                            'cancellation_reason': f'Other exit order ({filled_order_type}) was filled'
+                        }}
+                    )
+
+                except Exception as e:
+                    logger.warning(f"Failed to cancel {other_order_type} order {other_order['id']}: {e}")
+
+        except Exception as e:
+            log_exception_context(e, {'group_id': order_group.group_id, 'filled_order_type': filled_order_type})
+
+    async def _manage_exit_order_cancellation(self, order_group: AtomicOrderGroup):
+        """Manage exit order cancellation logic for order groups."""
+        # This method can be extended for more sophisticated exit order management
+        # For now, the cancellation is handled in _handle_order_completion_in_group
+        pass
     
     async def handle_command(self, command: Dict[str, Any]):
         """Handle execution gateway commands."""
@@ -451,8 +666,8 @@ class ExecutionGateway:
             # Cancel order on exchange
             result = await exchange.cancel_order(order_id, symbol)
             
-            # Update database
-            self.db.orders.update_one(
+            # Update database (async)
+            await self.db.orders.update_one(
                 {'order_id': order_id},
                 {'$set': {
                     'status': 'canceled',

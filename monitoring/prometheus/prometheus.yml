@@ -1,0 +1,109 @@
+# Prometheus configuration for Trading System monitoring
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+# Load rules once and periodically evaluate them according to the global 'evaluation_interval'.
+rule_files:
+  - "alert_rules.yml"
+
+# A scrape configuration containing exactly one endpoint to scrape:
+scrape_configs:
+  # The job name is added as a label `job=<job_name>` to any timeseries scraped from this config.
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Trading System Services
+  - job_name: 'trading-market-data'
+    static_configs:
+      - targets: ['market_data:8000']
+    scrape_interval: 5s
+    metrics_path: /metrics
+
+  - job_name: 'trading-strategy-engine'
+    static_configs:
+      - targets: ['strategy_engine:8001']
+    scrape_interval: 5s
+    metrics_path: /metrics
+
+  - job_name: 'trading-risk-management'
+    static_configs:
+      - targets: ['risk_management:8002']
+    scrape_interval: 5s
+    metrics_path: /metrics
+
+  - job_name: 'trading-execution-gateway'
+    static_configs:
+      - targets: ['execution_gateway:8003']
+    scrape_interval: 5s
+    metrics_path: /metrics
+
+  - job_name: 'trading-portfolio-accounting'
+    static_configs:
+      - targets: ['portfolio_accounting:8004']
+    scrape_interval: 5s
+    metrics_path: /metrics
+
+  - job_name: 'trading-trade-logger'
+    static_configs:
+      - targets: ['trade_logger:8005']
+    scrape_interval: 5s
+    metrics_path: /metrics
+
+  - job_name: 'trading-notifications'
+    static_configs:
+      - targets: ['notifications:8006']
+    scrape_interval: 5s
+    metrics_path: /metrics
+
+  - job_name: 'trading-backtesting'
+    static_configs:
+      - targets: ['backtesting:8007']
+    scrape_interval: 5s
+    metrics_path: /metrics
+
+  - job_name: 'trading-ui-gateway'
+    static_configs:
+      - targets: ['ui_gateway:8008']
+    scrape_interval: 5s
+    metrics_path: /metrics
+
+  - job_name: 'trading-outbox-publisher'
+    static_configs:
+      - targets: ['outbox_publisher:8009']
+    scrape_interval: 5s
+    metrics_path: /metrics
+
+  # Infrastructure Services
+  - job_name: 'postgresql'
+    static_configs:
+      - targets: ['postgresql:5432']
+    scrape_interval: 30s
+
+  - job_name: 'mongodb'
+    static_configs:
+      - targets: ['mongodb:27017']
+    scrape_interval: 30s
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis:6379']
+    scrape_interval: 30s
+
+  - job_name: 'rabbitmq'
+    static_configs:
+      - targets: ['rabbitmq:15692']
+    scrape_interval: 30s
+    metrics_path: /metrics
+
+# Remote write configuration for long-term storage (optional)
+# remote_write:
+#   - url: "http://cortex:9009/api/prom/push"
